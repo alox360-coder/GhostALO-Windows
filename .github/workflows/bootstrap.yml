@@ -1,0 +1,1913 @@
+name: Inizializza progetto
+
+# Da eseguire a mano (Actions -> Inizializza progetto -> Run workflow).
+# Scrive nel repository i file sorgente di GhostALO per Windows e avvia la compilazione.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Scrivi i file del progetto
+        run: |
+          mkdir -p "$(dirname '.gitignore')"
+          cat > '.gitignore' <<'EOF_PRJ'
+          __pycache__/
+          *.pyc
+          build/
+          dist/
+          *.spec
+          EOF_PRJ
+          mkdir -p "$(dirname 'README.md')"
+          cat > 'README.md' <<'EOF_PRJ'
+          # GhostALO per Windows (beta)
+
+          Programma per Windows in stile terminale (verde su nero) per controllare sicurezza e privacy del PC e fare pulizia.
+          Versione "gemella" dell'app Android GhostALO: stessa filosofia, ma è un programma scritto da zero.
+
+          - **Controllo rapido**: un clic per vedere se qualcosa richiede attenzione. Distingue ciò che è stato controllato da ciò che non si è potuto verificare.
+          - **Sicurezza del computer**: antivirus registrato, Windows Defender, firewall, aggiornamenti, UAC, Desktop remoto, Secure Boot, BitLocker, account amministratore.
+          - **Controllo privacy**: programmi all'avvio, attività pianificate non Microsoft, programmi di accesso remoto o di monitoraggio, estensioni dei browser con accesso ampio, file hosts modificato, proxy di sistema.
+          - **Pulizia**: file temporanei, rapporti di errore, miniature, cache dei browser, elenco dei file recenti, cookie, installer vecchi in Download. Si vede l'elenco, si conferma, e prima di eliminare si ricontrolla che i file non siano cambiati.
+          - **File grandi e vecchi**: nella cartella utente, con soglia a scelta. I file vanno nel Cestino di Windows.
+
+          Cache e temporanei si eliminano subito (i programmi li ricreano). I file dell'utente vanno sempre nel Cestino.
+
+          ## Limiti
+
+          - Non è un antivirus e non ha un database di malware: cerca indizi, non virus.
+          - Alcuni controlli richiedono i permessi di amministratore; se non sono verificabili lo dice, non li dà per buoni.
+          - Non invia nulla: non usa la rete.
+          - Il file `.exe` non è firmato digitalmente: Windows può mostrare l'avviso SmartScreen ("Esegui comunque").
+
+          ## Scaricare e verificare
+
+          Gli `.exe` sono nella sezione **Releases**, con il file `GhostALO.exe.sha256`: confronta l'impronta SHA-256 del file scaricato.
+
+          ## Sviluppo
+
+          ```
+          python -m unittest discover -s tests -v
+          python -m PyInstaller --onefile --windowed --name GhostALO --paths src main.py
+          ```
+
+          I test girano anche fuori da Windows (con un'interfaccia finta). La compilazione avviene in GitHub Actions (`.github/workflows/build.yml`).
+          EOF_PRJ
+          mkdir -p "$(dirname 'main.py')"
+          cat > 'main.py' <<'EOF_PRJ'
+          import os
+          import sys
+
+          sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
+          from ghostalo.ui import main  # noqa: E402
+
+          if __name__ == "__main__":
+              main()
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/__init__.py')"
+          cat > 'src/ghostalo/__init__.py' <<'EOF_PRJ'
+          VERSION = "0.1.0"
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/checks.py')"
+          cat > 'src/ghostalo/checks.py' <<'EOF_PRJ'
+          """Controlli di sicurezza e privacy. Tutto in locale; ciò che non si può verificare è 'na', mai 'ok'."""
+          import datetime
+          import glob
+          import json
+          import os
+          import re
+
+          from . import winutil
+          from .i18n import tr, trf
+
+          # stati: ok, info, warn, bad, na (non verificabile)
+          RANK = {"ok": 0, "na": 0, "info": 1, "warn": 2, "bad": 3}
+
+
+          class Check:
+              def __init__(self, status, title, detail=""):
+                  self.status = status
+                  self.title = title
+                  self.detail = detail
+
+
+          # ---------------------------------------------------------------- sicurezza
+
+          def _antivirus():
+              rows = winutil.powershell_json(
+                  "Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct "
+                  "| Select-Object displayName | ConvertTo-Json -Compress"
+              )
+              if rows is None:
+                  return Check("na", tr("Antivirus"), tr("Non sono riuscito a leggerlo."))
+              names = sorted({str(r.get("displayName", "")).strip() for r in rows if r.get("displayName")})
+              if not names:
+                  return Check("warn", tr("Antivirus"), tr("Nessun antivirus registrato in Windows."))
+              return Check("ok", tr("Antivirus"), ", ".join(names))
+
+
+          def _defender():
+              rows = winutil.powershell_json(
+                  "Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled,AntivirusSignatureAge "
+                  "| ConvertTo-Json -Compress"
+              )
+              if not rows:
+                  return Check("na", tr("Windows Defender"), tr("Non risponde (forse usi un altro antivirus)."))
+              r = rows[0]
+              if r.get("RealTimeProtectionEnabled") is False:
+                  return Check("warn", tr("Windows Defender"), tr("Protezione in tempo reale spenta."))
+              age = r.get("AntivirusSignatureAge")
+              if isinstance(age, int) and age > 7:
+                  return Check("warn", tr("Windows Defender"), trf("Definizioni non aggiornate da %s giorni.", age))
+              return Check("ok", tr("Windows Defender"), tr("Protezione attiva e aggiornata."))
+
+
+          def _firewall():
+              rows = winutil.powershell_json("Get-NetFirewallProfile | Select-Object Name,Enabled | ConvertTo-Json -Compress")
+              if not rows:
+                  return Check("na", tr("Firewall"), tr("Non sono riuscito a leggerlo."))
+              off = [str(r.get("Name")) for r in rows if r.get("Enabled") in (False, 0)]
+              if off:
+                  return Check("warn", tr("Firewall"), tr("Spento per i profili: ") + ", ".join(off))
+              return Check("ok", tr("Firewall"), tr("Attivo su tutti i profili."))
+
+
+          def parse_hotfix_days(text, today=None):
+              """Da 'AAAA-MM-GG' ai giorni trascorsi; None se non valido."""
+              try:
+                  d = datetime.datetime.strptime(text.strip(), "%Y-%m-%d").date()
+              except (ValueError, AttributeError):
+                  return None
+              today = today or datetime.date.today()
+              return (today - d).days
+
+
+          def _updates():
+              rc, out = winutil.powershell(
+                  "(Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1).InstalledOn.ToString('yyyy-MM-dd')"
+              )
+              days = parse_hotfix_days(out) if rc == 0 else None
+              if days is None:
+                  return Check("na", tr("Aggiornamenti di Windows"), tr("Data dell'ultimo aggiornamento non disponibile."))
+              if days > 90:
+                  return Check("warn", tr("Aggiornamenti di Windows"), trf("Ultimo aggiornamento installato %s giorni fa.", days))
+              return Check("ok", tr("Aggiornamenti di Windows"), trf("Ultimo aggiornamento installato %s giorni fa.", days))
+
+
+          def _uac():
+              v = winutil.reg_get("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA")
+              if v is None:
+                  return Check("na", tr("Controllo account utente (UAC)"), tr("Non disponibile."))
+              if v == 0:
+                  return Check("bad", tr("Controllo account utente (UAC)"), tr("Disattivato: i programmi possono ottenere privilegi senza chiedere."))
+              return Check("ok", tr("Controllo account utente (UAC)"), tr("Attivo."))
+
+
+          def _rdp():
+              v = winutil.reg_get("HKLM", r"SYSTEM\CurrentControlSet\Control\Terminal Server", "fDenyTSConnections")
+              if v is None:
+                  return Check("na", tr("Desktop remoto"), tr("Non disponibile."))
+              if v == 0:
+                  return Check("warn", tr("Desktop remoto"), tr("Attivo: se non ti serve, spegnilo (Impostazioni > Sistema > Desktop remoto)."))
+              return Check("ok", tr("Desktop remoto"), tr("Spento."))
+
+
+          def _secure_boot():
+              v = winutil.reg_get("HKLM", r"SYSTEM\CurrentControlSet\Control\SecureBoot\State", "UEFISecureBootEnabled")
+              if v is None:
+                  return Check("na", tr("Avvio protetto (Secure Boot)"), tr("Non disponibile o PC con BIOS tradizionale."))
+              if v == 1:
+                  return Check("ok", tr("Avvio protetto (Secure Boot)"), tr("Attivo."))
+              return Check("info", tr("Avvio protetto (Secure Boot)"), tr("Non attivo."))
+
+
+          def _bitlocker():
+              rc, out = winutil.powershell(
+                  "(New-Object -ComObject Shell.Application).NameSpace($env:SystemDrive).Self."
+                  "ExtendedProperty('System.Volume.BitLockerProtection')"
+              )
+              v = out.strip() if rc == 0 else ""
+              if v == "1":
+                  return Check("ok", tr("Cifratura del disco (BitLocker)"), tr("Attiva sul disco di sistema."))
+              if v in ("0", "2"):
+                  return Check(
+                      "info", tr("Cifratura del disco (BitLocker)"),
+                      tr("Non risulta attiva. Su un portatile proteggerebbe i dati in caso di furto (non è disponibile su tutte le edizioni di Windows)."),
+                  )
+              return Check("na", tr("Cifratura del disco (BitLocker)"), tr("Stato non verificabile."))
+
+
+          def _admin_account():
+              if winutil.is_admin():
+                  return Check(
+                      "info", tr("Account amministratore"),
+                      tr("Stai usando il programma come amministratore. Per l'uso di tutti i giorni è più sicuro un account standard."),
+                  )
+              return Check("ok", tr("Account amministratore"), tr("Account standard in uso."))
+
+
+          def run_security():
+              out = []
+              for f in (_antivirus, _defender, _firewall, _updates, _uac, _rdp, _secure_boot, _bitlocker, _admin_account):
+                  try:
+                      out.append(f())
+                  except Exception:
+                      out.append(Check("na", f.__name__.strip("_"), tr("Controllo non riuscito.")))
+              return out
+
+
+          # ---------------------------------------------------------------- privacy
+
+          RISKY_DIRS = ("\\temp\\", "\\downloads\\", "\\appdata\\local\\temp", "\\users\\public\\")
+
+
+          def classify_command(cmd):
+              """'warn' se il comando parte da una cartella tipica del malware, altrimenti 'info'."""
+              c = (cmd or "").lower().replace("/", "\\")
+              if any(d in c for d in RISKY_DIRS):
+                  return "warn"
+              if "-enc" in c and "powershell" in c:
+                  return "warn"
+              return "info"
+
+
+          def _startup():
+              items = []
+              keys = [
+                  ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"),
+                  ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+                  ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"),
+              ]
+              for hive, path in keys:
+                  for name, val in winutil.reg_values(hive, path):
+                      items.append(Check(classify_command(str(val)), str(name), str(val)))
+              startup_dirs = [
+                  winutil.pj(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"),
+                  winutil.pj(os.environ.get("PROGRAMDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup"),
+              ]
+              for d in startup_dirs:
+                  if d and os.path.isdir(d):
+                      for f in sorted(os.listdir(d)):
+                          if f.lower() != "desktop.ini":
+                              items.append(Check("info", f, d))
+              return items
+
+
+          def _tasks():
+              rows = winutil.powershell_json(
+                  "Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft\\*' } | ForEach-Object { "
+                  "[pscustomobject]@{Name=$_.TaskName; Exec=(($_.Actions | Select-Object -First 1 | "
+                  "ForEach-Object { $_.Execute + ' ' + $_.Arguments }))} } | ConvertTo-Json -Compress",
+                  timeout=40,
+              )
+              if rows is None:
+                  return None
+              return [Check(classify_command(str(r.get("Exec"))), str(r.get("Name")), str(r.get("Exec") or "").strip()) for r in rows]
+
+
+          REMOTE_TOOLS = (
+              "anydesk", "teamviewer", "ultraviewer", "rustdesk", "ammyy", "logmein", "realvnc", "tightvnc",
+              "ultravnc", "remote utilities", "radmin", "splashtop", "supremo", "chrome remote desktop", "screenconnect",
+          )
+          MONITOR_TOOLS = (
+              "kidlogger", "spyrix", "refog", "actual spy", "ardamax", "spytech", "keylogger", "revealer", "pc monitor",
+              "employee monitoring", "spyagent",
+          )
+
+
+          def classify_program(name):
+              n = (name or "").lower()
+              if any(k in n for k in MONITOR_TOOLS):
+                  return "warn"
+              if any(k in n for k in REMOTE_TOOLS):
+                  return "info"
+              return None
+
+
+          def installed_programs():
+              names = set()
+              paths = [
+                  ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                  ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                  ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Uninstall"),
+              ]
+              for hive, base in paths:
+                  for sub in winutil.reg_subkeys(hive, base):
+                      n = winutil.reg_get(hive, base + "\\" + sub, "DisplayName")
+                      if n:
+                          names.add(str(n))
+              return sorted(names)
+
+
+          def _remote_tools():
+              found = []
+              for n in installed_programs():
+                  c = classify_program(n)
+                  if c:
+                      found.append(Check(c, n, tr("Programma installato.")))
+              for p in sorted(winutil.running_processes()):
+                  c = classify_program(p.replace(".exe", ""))
+                  if c:
+                      found.append(Check(c, p, tr("In esecuzione adesso.")))
+              return found
+
+
+          def parse_manifest(text):
+              """Estrae (nome, accesso_ampio) da un manifest di estensione; None se non valido."""
+              try:
+                  m = json.loads(text)
+              except ValueError:
+                  return None
+              name = str(m.get("name", ""))
+              perms = [str(p) for p in m.get("permissions", []) if isinstance(p, str)]
+              perms += [str(p) for p in m.get("host_permissions", []) if isinstance(p, str)]
+              for cs in m.get("content_scripts", []) or []:
+                  perms += [str(p) for p in cs.get("matches", []) if isinstance(p, str)]
+              broad = any(p in ("<all_urls>", "*://*/*", "http://*/*", "https://*/*") for p in perms)
+              return name, broad
+
+
+          def _extensions():
+              local = os.environ.get("LOCALAPPDATA", "")
+              roots = {
+                  "Chrome": r"Google\Chrome\User Data",
+                  "Edge": r"Microsoft\Edge\User Data",
+                  "Brave": r"BraveSoftware\Brave-Browser\User Data",
+              }
+              out = []
+              for browser, rel in roots.items():
+                  base = winutil.pj(local, rel)
+                  for manifest in glob.glob(os.path.join(base, "*", "Extensions", "*", "*", "manifest.json")):
+                      try:
+                          with open(manifest, encoding="utf-8-sig") as f:
+                              parsed = parse_manifest(f.read())
+                      except OSError:
+                          continue
+                      if not parsed:
+                          continue
+                      name, broad = parsed
+                      ext_id = manifest.split(os.sep)[-3]
+                      if name.startswith("__MSG_"):
+                          name = ext_id
+                      out.append(Check(
+                          "info" if broad else "ok", "%s: %s" % (browser, name),
+                          tr("Può leggere tutti i siti che visiti.") if broad else tr("Accesso limitato."),
+                      ))
+              return out
+
+
+          def parse_hosts(text):
+              """Righe attive del file hosts (esclusi commenti e localhost)."""
+              out = []
+              for line in text.splitlines():
+                  line = line.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  if len(parts) >= 2 and all(h.lower() not in ("localhost", "localhost.localdomain", "broadcasthost") for h in parts[1:]):
+                      out.append(line)
+              return out
+
+
+          def _hosts():
+              path = winutil.pj(os.environ.get("SystemRoot", r"C:\Windows"), r"System32\drivers\etc\hosts")
+              try:
+                  with open(path, encoding="utf-8", errors="replace") as f:
+                      return parse_hosts(f.read())
+              except OSError:
+                  return None
+
+
+          def _proxy():
+              enabled = winutil.reg_get("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", "ProxyEnable")
+              server = winutil.reg_get("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", "ProxyServer")
+              if enabled is None:
+                  return Check("na", tr("Proxy di sistema"), tr("Non disponibile."))
+              if enabled == 1:
+                  return Check("warn", tr("Proxy di sistema"), tr("Attivo: ") + str(server) + tr(". Se non l'hai impostato tu, il traffico potrebbe passare da altri."))
+              return Check("ok", tr("Proxy di sistema"), tr("Nessun proxy impostato."))
+
+
+          class PrivacyReport:
+              def __init__(self):
+                  self.startup = []
+                  self.tasks = None
+                  self.remote = []
+                  self.extensions = []
+                  self.hosts = None
+                  self.proxy = None
+
+              def findings(self):
+                  """Le voci che richiedono attenzione (warn o info rilevanti), con la sezione."""
+                  out = []
+                  for c in self.startup:
+                      if c.status == "warn":
+                          out.append(Check("warn", tr("Avvio automatico: ") + c.title, c.detail))
+                  for c in (self.tasks or []):
+                      if c.status == "warn":
+                          out.append(Check("warn", tr("Attività pianificata: ") + c.title, c.detail))
+                  for c in self.remote:
+                      out.append(Check(c.status, tr("Accesso remoto o monitoraggio: ") + c.title, c.detail))
+                  if self.hosts:
+                      out.append(Check("info", tr("File hosts modificato"), trf("%s righe personalizzate.", len(self.hosts))))
+                  if self.proxy and self.proxy.status in ("warn", "bad"):
+                      out.append(self.proxy)
+                  return out
+
+              def incomplete(self):
+                  return self.tasks is None or self.hosts is None or (self.proxy is not None and self.proxy.status == "na")
+
+
+          def run_privacy():
+              r = PrivacyReport()
+              steps = [
+                  ("startup", _startup), ("tasks", _tasks), ("remote", _remote_tools),
+                  ("extensions", _extensions), ("hosts", _hosts), ("proxy", _proxy),
+              ]
+              for attr, fn in steps:
+                  try:
+                      setattr(r, attr, fn())
+                  except Exception:
+                      setattr(r, attr, None if attr in ("tasks", "hosts", "proxy") else [])
+              return r
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/cleaner.py')"
+          cat > 'src/ghostalo/cleaner.py' <<'EOF_PRJ'
+          """Pulizia con anteprima. Mai alla cieca: si scansiona, si mostra, si conferma, poi si elimina.
+
+          Due modalità:
+          - 'delete': dati che i programmi ricreano da soli (temporanei, cache). Eliminati subito.
+          - 'recycle': file dell'utente (Download, file grandi). Vanno nel Cestino di Windows.
+          Prima di eliminare si ricontrolla che ogni file non sia cambiato dopo la scansione.
+          """
+          import glob
+          import os
+          import threading
+          import time
+
+          from . import winutil
+          from .i18n import tr
+
+          DAY = 86400
+          MAX_VISITED = 400000
+
+
+          class Cancelled(Exception):
+              pass
+
+
+          class Item:
+              def __init__(self, path, size, mtime):
+                  self.path = path
+                  self.size = size
+                  self.mtime = mtime
+
+
+          class Category:
+              def __init__(self, key, title, hint, mode, checked, roots, processes=()):
+                  self.key = key
+                  self.title = title
+                  self.hint = hint
+                  self.mode = mode          # 'delete' | 'recycle'
+                  self.checked = checked
+                  self.roots = roots        # cartelle in cui sono ammessi i file (sicurezza)
+                  self.processes = processes  # programmi da chiudere prima (nomi .exe in minuscolo)
+                  self.items = []
+
+              @property
+              def bytes(self):
+                  return sum(i.size for i in self.items)
+
+              @property
+              def count(self):
+                  return len(self.items)
+
+
+          class Result:
+              def __init__(self):
+                  self.freed = 0
+                  self.failed = 0
+                  self.changed = 0
+                  self.recycled = 0
+
+
+          def _check(cancel):
+              if cancel is not None and cancel.is_set():
+                  raise Cancelled()
+
+
+          def walk_files(root, cancel=None, limit=MAX_VISITED, skip_dirs=()):
+              """Genera (percorso, dimensione, data) dei file sotto root, senza seguire collegamenti o giunzioni."""
+              stack = [root]
+              visited = 0
+              skip = {s.lower() for s in skip_dirs}
+              while stack and visited < limit:
+                  _check(cancel)
+                  d = stack.pop()
+                  try:
+                      it = os.scandir(d)
+                  except OSError:
+                      continue
+                  with it:
+                      for e in it:
+                          visited += 1
+                          try:
+                              if e.is_symlink() or getattr(e, "is_junction", lambda: False)():
+                                  continue
+                              if e.is_dir(follow_symlinks=False):
+                                  if e.name.lower() in skip:
+                                      continue
+                                  stack.append(e.path)
+                              elif e.is_file(follow_symlinks=False):
+                                  st = e.stat(follow_symlinks=False)
+                                  yield e.path, st.st_size, st.st_mtime
+                          except OSError:
+                              continue
+
+
+          def _under(path, roots):
+              try:
+                  rp = os.path.realpath(path)
+                  for r in roots:
+                      rr = os.path.realpath(r)
+                      if rp == rr or rp.startswith(rr.rstrip("\\/") + os.sep):
+                          return True
+              except OSError:
+                  pass
+              return False
+
+
+          def default_env():
+              e = os.environ
+              home = e.get("USERPROFILE") or os.path.expanduser("~")
+              return {
+                  "TEMP": e.get("TEMP") or os.path.join(home, "AppData", "Local", "Temp"),
+                  "LOCALAPPDATA": e.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local"),
+                  "APPDATA": e.get("APPDATA") or os.path.join(home, "AppData", "Roaming"),
+                  "USERPROFILE": home,
+              }
+
+
+          BROWSERS = {
+              # nome: (cartella dati in LOCALAPPDATA, processo)
+              "Chrome": (r"Google\Chrome\User Data", "chrome.exe"),
+              "Edge": (r"Microsoft\Edge\User Data", "msedge.exe"),
+              "Brave": (r"BraveSoftware\Brave-Browser\User Data", "brave.exe"),
+          }
+
+
+          def _profiles(base):
+              out = []
+              for name in ("Default",) + tuple("Profile %d" % i for i in range(1, 10)):
+                  p = os.path.join(base, name)
+                  if os.path.isdir(p):
+                      out.append(p)
+              return out
+
+
+          def _firefox_profiles(root):
+              return [p for p in glob.glob(os.path.join(root, "*")) if os.path.isdir(p)]
+
+
+          def build_categories(env=None):
+              """Crea le categorie (vuote) con le cartelle in cui possono lavorare."""
+              env = env or default_env()
+              local, roam, home, temp = env["LOCALAPPDATA"], env["APPDATA"], env["USERPROFILE"], env["TEMP"]
+              # Sicurezza: se TEMP punta fuori dal profilo utente (es. una cartella radice), non lo si usa.
+              if not _under(temp, [home, local]):
+                  temp = os.path.join(local, "Temp")
+
+              cats = []
+              cats.append(Category("temp", tr("File temporanei"), tr("Cartella Temp dell'utente: file più vecchi di un giorno che i programmi ricreano."),
+                                   "delete", True, [temp]))
+              cats.append(Category("dumps", tr("Rapporti di errore e dump"), tr("Dump di crash e rapporti di errore di Windows."),
+                                   "delete", True,
+                                   [os.path.join(local, "CrashDumps"), winutil.pj(local, r"Microsoft\Windows\WER")]))
+              cats.append(Category("thumbs", tr("Miniature e icone in cache"), tr("Cache di Esplora file: Windows la ricrea se serve."),
+                                   "delete", True, [winutil.pj(local, r"Microsoft\Windows\Explorer")]))
+              cache_roots = []
+              procs = []
+              for name, (rel, proc) in BROWSERS.items():
+                  base = winutil.pj(local, rel)
+                  for prof in _profiles(base):
+                      for sub in ("Cache", "Code Cache", "GPUCache"):
+                          cache_roots.append(os.path.join(prof, sub))
+                  procs.append(proc)
+              cache_roots += [os.path.join(p, "cache2") for p in _firefox_profiles(winutil.pj(local, r"Mozilla\Firefox\Profiles"))]
+              procs.append("firefox.exe")
+              cats.append(Category("browser", tr("Cache dei browser"), tr("Cache di Chrome, Edge, Brave e Firefox. Chiudi il browser prima."),
+                                   "delete", True, cache_roots, tuple(procs)))
+              cats.append(Category("recent", tr("Elenco dei file recenti"), tr("Cronologia di Windows dei file aperti di recente (privacy)."),
+                                   "delete", False,
+                                   [winutil.pj(roam, r"Microsoft\Windows\Recent")]))
+              cookie_roots = []
+              for name, (rel, _p) in BROWSERS.items():
+                  base = winutil.pj(local, rel)
+                  for prof in _profiles(base):
+                      cookie_roots.append(os.path.join(prof, "Network"))
+              cookie_roots += _firefox_profiles(winutil.pj(roam, r"Mozilla\Firefox\Profiles"))
+              cats.append(Category("cookies", tr("Cookie dei browser"), tr("Attenzione: dopo averli eliminati vieni disconnesso dai siti. Chiudi il browser prima."),
+                                   "delete", False, cookie_roots, tuple(procs)))
+              cats.append(Category("installers", tr("Installer vecchi in Download"),
+                                   tr("File .exe, .msi, .iso e archivi in Download non modificati da oltre 90 giorni. Vanno nel Cestino."),
+                                   "recycle", False, [os.path.join(home, "Downloads")]))
+              return cats
+
+
+          COOKIE_NAMES = ("cookies", "cookies-journal", "cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm")
+          INSTALLER_EXT = (".exe", ".msi", ".msix", ".iso", ".zip", ".rar", ".7z")
+
+
+          def _accept(cat, path, mtime, now):
+              name = os.path.basename(path).lower()
+              if cat.key == "temp":
+                  return now - mtime > DAY
+              if cat.key == "dumps":
+                  return True
+              if cat.key == "thumbs":
+                  return name.startswith(("thumbcache_", "iconcache_"))
+              if cat.key == "browser":
+                  return True
+              if cat.key == "recent":
+                  return name.endswith(".lnk") or "destinations" in path.lower()
+              if cat.key == "cookies":
+                  return name in COOKIE_NAMES
+              if cat.key == "installers":
+                  return name.endswith(INSTALLER_EXT) and now - mtime > 90 * DAY
+              return False
+
+
+          def scan(cats, cancel=None, now=None):
+              """Riempie le categorie. Non modifica nulla."""
+              now = now or time.time()
+              for cat in cats:
+                  cat.items = []
+                  seen = set()
+                  for root in cat.roots:
+                      if not os.path.isdir(root):
+                          continue
+                      for path, size, mtime in walk_files(root, cancel):
+                          if path in seen:
+                              continue
+                          if _accept(cat, path, mtime, now):
+                              seen.add(path)
+                              cat.items.append(Item(path, size, mtime))
+              return [c for c in cats if c.count > 0]
+
+
+          def scan_big(root, min_mb, age_days, cancel=None, now=None, limit_results=40):
+              """File grandi e non modificati da tempo nel profilo utente (esclusa AppData). Non modifica nulla."""
+              now = now or time.time()
+              cat = Category("big", tr("File grandi e vecchi"), tr("File pesanti non modificati da tempo. Vanno nel Cestino."),
+                             "recycle", False, [root])
+              min_bytes = min_mb * 1024 * 1024
+              found = []
+              for path, size, mtime in walk_files(root, cancel, skip_dirs=("AppData", "$Recycle.Bin")):
+                  if size >= min_bytes and now - mtime > age_days * DAY:
+                      found.append(Item(path, size, mtime))
+              found.sort(key=lambda i: i.size, reverse=True)
+              cat.items = found[:limit_results]
+              return cat
+
+
+          def process_running(cat):
+              if not cat.processes:
+                  return []
+              running = winutil.running_processes()
+              return sorted(p for p in cat.processes if p in running)
+
+
+          def delete(cats, cancel=None):
+              """Elimina gli elementi delle categorie. Ricontrolla ogni file prima di toccarlo."""
+              res = Result()
+              for cat in cats:
+                  for it in cat.items:
+                      _check(cancel)
+                      try:
+                          st = os.stat(it.path, follow_symlinks=False)
+                      except OSError:
+                          continue  # già sparito
+                      if st.st_size != it.size or abs(st.st_mtime - it.mtime) > 1.0:
+                          res.changed += 1
+                          continue
+                      if os.path.islink(it.path) or not _under(it.path, cat.roots):
+                          res.failed += 1
+                          continue
+                      if cat.mode == "recycle":
+                          if winutil.recycle(it.path):
+                              res.recycled += it.size
+                          else:
+                              res.failed += 1
+                      else:
+                          try:
+                              os.remove(it.path)
+                              res.freed += it.size
+                          except OSError:
+                              res.failed += 1
+              return res
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/en.py')"
+          cat > 'src/ghostalo/en.py' <<'EOF_PRJ'
+          """Traduzioni inglesi. Se manca una voce resta il testo italiano."""
+          EN = {
+          "File grandi e vecchi": "Large and old files",
+          "File pesanti non modificati da tempo. Vanno nel Cestino.": "Heavy files not modified for a while. They go to the Recycle Bin.",
+          "File temporanei": "Temporary files",
+          "Cartella Temp dell'utente: file più vecchi di un giorno che i programmi ricreano.": "The user's Temp folder: files older than a day that programs recreate.",
+          "Rapporti di errore e dump": "Error reports and dumps",
+          "Dump di crash e rapporti di errore di Windows.": "Crash dumps and Windows error reports.",
+          "Miniature e icone in cache": "Cached thumbnails and icons",
+          "Cache di Esplora file: Windows la ricrea se serve.": "File Explorer cache: Windows recreates it when needed.",
+          "Cache dei browser": "Browser caches",
+          "Cache di Chrome, Edge, Brave e Firefox. Chiudi il browser prima.": "Chrome, Edge, Brave and Firefox caches. Close the browser first.",
+          "Elenco dei file recenti": "Recent files list",
+          "Cronologia di Windows dei file aperti di recente (privacy).": "Windows history of recently opened files (privacy).",
+          "Cookie dei browser": "Browser cookies",
+          "Attenzione: dopo averli eliminati vieni disconnesso dai siti. Chiudi il browser prima.": "Warning: after deleting them you are logged out of websites. Close the browser first.",
+          "Installer vecchi in Download": "Old installers in Downloads",
+          "File .exe, .msi, .iso e archivi in Download non modificati da oltre 90 giorni. Vanno nel Cestino.": ".exe, .msi, .iso files and archives in Downloads not modified for over 90 days. They go to the Recycle Bin.",
+          "1 elemento": "1 item",
+          "%s elementi": "%s items",
+          "[<] Menu principale": "[<] Main menu",
+          "Tutto resta nel computer: nessun dato viene inviato.": "Everything stays on the computer: no data is sent.",
+          "[>] CONTROLLO RAPIDO\n     un clic: sicurezza e privacy del PC": "[>] QUICK CHECK\n     one click: PC security and privacy",
+          "[S] Sicurezza del computer\n     antivirus, firewall, aggiornamenti, cifratura": "[S] Computer security\n     antivirus, firewall, updates, encryption",
+          "[P] Controllo privacy\n     avvio automatico, accesso remoto, estensioni, proxy": "[P] Privacy check\n     startup, remote access, extensions, proxy",
+          "[C] Pulizia\n     temporanei, cache, cookie, file recenti": "[C] Cleaning\n     temp files, cache, cookies, recent files",
+          "[G] File grandi e vecchi\n     trova i file che occupano più spazio": "[G] Large and old files\n     find the files that use the most space",
+          "[?] Informazioni e limiti": "[?] Information and limits",
+          "CONTROLLO_RAPIDO": "QUICK_CHECK",
+          "Controllo il computer…": "Checking the computer…",
+          "CONTROLLI ESEGUITI": "CHECKS PERFORMED",
+          "Nessun segnale non significa nessun virus: questo programma non è un antivirus e non ha un database di malware.": "No signal does not mean no virus: this program is not an antivirus and has no malware database.",
+          "[>] Dettagli sicurezza": "[>] Security details",
+          "[>] Dettagli privacy": "[>] Privacy details",
+          "[>] Ripeti controllo": "[>] Run the check again",
+          "SICUREZZA_DEL_COMPUTER": "COMPUTER_SECURITY",
+          "Controllo…": "Checking…",
+          "CONTROLLO_PRIVACY": "PRIVACY_CHECK",
+          "Sono indizi, non prove: molti programmi legittimi si avviano da soli o permettono l'accesso remoto.": "These are hints, not proof: many legitimate programs start by themselves or allow remote access.",
+          "DA VERIFICARE": "TO CHECK",
+          "ATTIVITÀ PIANIFICATE (NON MICROSOFT)": "SCHEDULED TASKS (NON-MICROSOFT)",
+          "ESTENSIONI DEL BROWSER": "BROWSER EXTENSIONS",
+          "PROXY": "PROXY",
+          "PULIZIA": "CLEANING",
+          "Cerca file inutili e mostra cosa occupano. Prima di eliminare vedi l'elenco e ti viene chiesta conferma. Cache e temporanei si eliminano subito (i programmi li ricreano); i file tuoi vanno nel Cestino di Windows.": "Finds useless files and shows what they use. Before deleting you see the list and are asked to confirm. Cache and temp files are deleted right away (programs recreate them); your own files go to the Windows Recycle Bin.",
+          "[>] Avvia scansione": "[>] Start scan",
+          "Scansione in corso…": "Scanning…",
+          "[x] Annulla": "[x] Cancel",
+          "RISULTATO_PULIZIA": "CLEANING_RESULT",
+          "Spunta ciò che vuoi eliminare.": "Tick what you want to delete.",
+          "[>] Elimina selezionati": "[>] Delete selected",
+          "[>] Ripeti scansione": "[>] Scan again",
+          "ELIMINAZIONE": "DELETION",
+          "Eliminazione in corso…": "Deleting…",
+          "PULIZIA_COMPLETATA": "CLEANING_DONE",
+          "[>] Nuova scansione": "[>] New scan",
+          "FILE_GRANDI_E_VECCHI": "LARGE_AND_OLD_FILES",
+          "Cerca nella tua cartella utente (esclusa AppData) i file pesanti non modificati da tempo. Vedi l'elenco e confermi tu; i file vanno nel Cestino.": "Looks in your user folder (excluding AppData) for heavy files not modified for a while. You see the list and confirm; files go to the Recycle Bin.",
+          "DIMENSIONE MINIMA": "MINIMUM SIZE",
+          "NON MODIFICATI DA": "NOT MODIFIED FOR",
+          "[>] Elimina i selezionati": "[>] Delete selected",
+          "[<] Cambia criteri": "[<] Change criteria",
+          "GhostALO per Windows usa solo funzioni ufficiali di Windows. Non invia nulla, non ha un database di malware e non elimina niente senza la tua conferma.": "GhostALO for Windows uses only official Windows features. It sends nothing, has no malware database and deletes nothing without your confirmation.",
+          "Limiti": "Limits",
+          "• Non è un antivirus: cerca indizi, non virus.\n• Alcuni controlli richiedono i permessi di amministratore.\n• I risultati sono indizi, non prove.\n• Cache e temporanei si eliminano subito; i file tuoi vanno nel Cestino.\n• Se sospetti un controllo nascosto del PC, il ripristino di Windows è la soluzione più sicura (salva prima i dati e cambia le password da un altro dispositivo).": "• It is not an antivirus: it looks for hints, not viruses.\n• Some checks need administrator rights.\n• Results are hints, not proof.\n• Cache and temp files are deleted right away; your own files go to the Recycle Bin.\n• If you suspect hidden control of the PC, resetting Windows is the safest solution (save your data first and change your passwords from another device).",
+          "per Windows": "for Windows",
+          "Non sono riuscito a completare il controllo.": "I could not complete the check.",
+          "[>] Riprova": "[>] Try again",
+          "[XX] PROBLEMI DA RISOLVERE": "[XX] PROBLEMS TO FIX",
+          "Sicurezza del computer: %s controlli completati": "Computer security: %s checks completed",
+          "Privacy: avvio automatico, attività pianificate, accesso remoto, estensioni, file hosts, proxy": "Privacy: startup, scheduled tasks, remote access, extensions, hosts file, proxy",
+          "Alcuni controlli sono più completi se avvii il programma come amministratore (clic destro > Esegui come amministratore).": "Some checks are more complete if you run the program as administrator (right-click > Run as administrator).",
+          "Nessun segnale evidente.": "No obvious signal.",
+          "PROGRAMMI ALL'AVVIO": "STARTUP PROGRAMS",
+          "Nessuna estensione trovata (Chrome, Edge, Brave).": "No extension found (Chrome, Edge, Brave).",
+          "Non sono riuscito a completare la scansione.": "I could not complete the scan.",
+          "Non ho trovato niente da pulire.": "I found nothing to clean.",
+          "). Le voci dei file tuoi vanno nel Cestino di Windows, le altre vengono eliminate subito. Continuare?": "). Your own files go to the Windows Recycle Bin, the others are deleted right away. Continue?",
+          "Conferma eliminazione": "Confirm deletion",
+          "Si è verificato un errore durante l'eliminazione.": "An error occurred during deletion.",
+          "Nessun file trovato con questi criteri.": "No files found with these criteria.",
+          "Eliminare questi file?": "Delete these files?",
+          "%s file, %s. Vanno nel Cestino di Windows e puoi ripristinarli.": "%s files, %s. They go to the Windows Recycle Bin and you can restore them.",
+          "Si è verificato un errore. Il rapporto è salvato qui (non è stato inviato da nessuna parte):": "An error occurred. The report is saved here (it was not sent anywhere):",
+          "Segnali che richiedono un controllo tuo: non sono la prova di un'infezione.": "Signals that need a check by you: they are not proof of an infection.",
+          "%s controlli non verificabili (di solito servono i permessi di amministratore)": "%s checks could not be verified (usually administrator rights are needed)",
+          "Non verificabile.": "Cannot be verified.",
+          "Nessuna.": "None.",
+          "Selezionato: %s": "Selected: %s",
+          "Nessuna voce selezionata.": "No item selected.",
+          "Verranno eliminati %s (": "These will be deleted: %s (",
+          "Lo spazio si libera quando svuoti il Cestino di Windows.": "Space is freed when you empty the Windows Recycle Bin.",
+          "%s file sono cambiati dopo la scansione e non sono stati toccati.": "%s files changed after the scan and were not touched.",
+          "%s file non è stato possibile eliminarli (in uso o protetti).": "%s files could not be deleted (in use or protected).",
+          "%s giorni": "%s days",
+          "Selezionati: %s file, %s": "Selected: %s files, %s",
+          "Nessun file selezionato.": "No file selected.",
+          "[!!] DA VERIFICARE": "[!!] TO CHECK",
+          "[??] CONTROLLO INCOMPLETO": "[??] CHECK INCOMPLETE",
+          "[OK] NESSUN SEGNALE RILEVATO": "[OK] NO SIGNAL DETECTED",
+          "[!!] Chiudi prima: ": "[!!] Close first: ",
+          "Spazio liberato: ": "Space freed: ",
+          "Spostati nel Cestino: ": "Moved to the Recycle Bin: ",
+          "Versione": "Version",
+          "Antivirus": "Antivirus",
+          "Windows Defender": "Windows Defender",
+          "Protezione attiva e aggiornata.": "Protection active and up to date.",
+          "Firewall": "Firewall",
+          "Attivo su tutti i profili.": "Active on all profiles.",
+          "Aggiornamenti di Windows": "Windows updates",
+          "Ultimo aggiornamento installato %s giorni fa.": "Last update installed %s days ago.",
+          "Controllo account utente (UAC)": "User Account Control (UAC)",
+          "Attivo.": "Active.",
+          "Desktop remoto": "Remote Desktop",
+          "Spento.": "Off.",
+          "Avvio protetto (Secure Boot)": "Secure Boot",
+          "Non attivo.": "Not active.",
+          "Cifratura del disco (BitLocker)": "Disk encryption (BitLocker)",
+          "Stato non verificabile.": "Status cannot be verified.",
+          "Account amministratore": "Administrator account",
+          "Account standard in uso.": "Standard account in use.",
+          "Proxy di sistema": "System proxy",
+          "Nessun proxy impostato.": "No proxy set.",
+          "Non sono riuscito a leggerlo.": "I could not read it.",
+          "Nessun antivirus registrato in Windows.": "No antivirus registered in Windows.",
+          "Non risponde (forse usi un altro antivirus).": "Not responding (you may use another antivirus).",
+          "Protezione in tempo reale spenta.": "Real-time protection is off.",
+          "Definizioni non aggiornate da %s giorni.": "Definitions not updated for %s days.",
+          "Data dell'ultimo aggiornamento non disponibile.": "Date of the last update not available.",
+          "Non disponibile.": "Not available.",
+          "Disattivato: i programmi possono ottenere privilegi senza chiedere.": "Disabled: programs can get privileges without asking.",
+          "Attivo: se non ti serve, spegnilo (Impostazioni > Sistema > Desktop remoto).": "Active: if you do not need it, turn it off (Settings > System > Remote Desktop).",
+          "Non disponibile o PC con BIOS tradizionale.": "Not available, or PC with a legacy BIOS.",
+          "Attiva sul disco di sistema.": "Active on the system drive.",
+          "Non risulta attiva. Su un portatile proteggerebbe i dati in caso di furto (non è disponibile su tutte le edizioni di Windows).": "Does not appear to be active. On a laptop it would protect your data if stolen (it is not available on all Windows editions).",
+          "Stai usando il programma come amministratore. Per l'uso di tutti i giorni è più sicuro un account standard.": "You are running the program as administrator. For everyday use a standard account is safer.",
+          "Spento per i profili: ": "Off for profiles: ",
+          ". Se non l'hai impostato tu, il traffico potrebbe passare da altri.": ". If you did not set it, your traffic may pass through someone else.",
+          "Programma installato.": "Installed program.",
+          "In esecuzione adesso.": "Running now.",
+          "Attivo: ": "Active: ",
+          "File hosts modificato": "Hosts file modified",
+          "%s righe personalizzate.": "%s custom lines.",
+          "Controllo non riuscito.": "Check failed.",
+          "Può leggere tutti i siti che visiti.": "Can read every site you visit.",
+          "Accesso limitato.": "Limited access.",
+          "Accesso remoto o monitoraggio: ": "Remote access or monitoring: ",
+          "Avvio automatico: ": "Startup: ",
+          "Attività pianificata: ": "Scheduled task: ",
+          }
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/i18n.py')"
+          cat > 'src/ghostalo/i18n.py' <<'EOF_PRJ'
+          """Traduzioni: il codice contiene i testi in italiano; con Windows non in italiano si usa l'inglese."""
+          import ctypes
+          import locale
+          import os
+
+          from .en import EN
+
+          _italian = True
+
+
+          def init():
+              global _italian
+              lang = ""
+              try:
+                  if os.name == "nt":
+                      lid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+                      lang = locale.windows_locale.get(lid, "")
+                  else:
+                      lang = locale.getlocale()[0] or ""
+              except Exception:
+                  lang = ""
+              _italian = lang.lower().startswith("it")
+
+
+          def set_italian(v):
+              global _italian
+              _italian = v
+
+
+          def tr(s):
+              return s if _italian else EN.get(s, s)
+
+
+          def trf(s, *args):
+              try:
+                  return tr(s) % args
+              except (TypeError, ValueError):
+                  return s % args
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/ui.py')"
+          cat > 'src/ghostalo/ui.py' <<'EOF_PRJ'
+          """Interfaccia in stile terminale (verde su nero). Le scansioni girano in un thread a parte."""
+          import os
+          import queue
+          import threading
+          import time
+          import tkinter as tk
+          from tkinter import messagebox
+
+          from . import VERSION, checks, cleaner, winutil
+          from .i18n import tr, trf
+
+          BG = "#000000"
+          GREEN = "#00FF41"
+          DARK = "#00E63B"
+          GREY = "#00A329"
+          ORANGE = "#FFB000"
+          RED = "#FF3B30"
+          FONT = ("Consolas", 11)
+          FONT_B = ("Consolas", 11, "bold")
+          WRAP = 820
+
+
+          def fmt(n):
+              n = float(n)
+              for unit in ("B", "KB", "MB", "GB"):
+                  if n < 1024 or unit == "GB":
+                      return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+                  n /= 1024.0
+
+
+          def items(n):
+              return tr("1 elemento") if n == 1 else trf("%s elementi", n)
+
+
+          class App:
+              def __init__(self, root):
+                  self.root = root
+                  root.title("GhostALO")
+                  root.configure(bg=BG)
+                  root.geometry("900x720")
+                  root.minsize(760, 520)
+                  self.q = queue.Queue()
+                  self.cancel = threading.Event()
+                  self.token = 0
+                  self.screen = "menu"
+                  self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
+                  self.bar = tk.Scrollbar(root, orient="vertical", command=self.canvas.yview)
+                  self.canvas.configure(yscrollcommand=self.bar.set)
+                  self.bar.pack(side="right", fill="y")
+                  self.canvas.pack(side="left", fill="both", expand=True)
+                  self.box = tk.Frame(self.canvas, bg=BG)
+                  self.win = self.canvas.create_window((0, 0), window=self.box, anchor="nw")
+                  self.box.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+                  self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.win, width=e.width))
+                  root.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(int(-e.delta / 120), "units"))
+                  root.report_callback_exception = self.on_error
+                  self.poll()
+                  self.show_menu()
+
+              # ---------- infrastruttura ----------
+
+              def poll(self):
+                  try:
+                      while True:
+                          fn = self.q.get_nowait()
+                          fn()
+                  except queue.Empty:
+                      pass
+                  self.root.after(100, self.poll)
+
+              def run_bg(self, fn, done):
+                  """Esegue fn in un thread; done(risultato) gira nel thread dell'interfaccia."""
+                  self.cancel.set()
+                  self.cancel = threading.Event()
+                  cancel = self.cancel
+                  my = self.token
+
+                  def job():
+                      try:
+                          res = fn(cancel)
+                      except cleaner.Cancelled:
+                          return
+                      except Exception as e:  # mai bloccare l'interfaccia
+                          res = e
+                      self.q.put(lambda: done(res) if my == self.token else None)
+
+                  threading.Thread(target=job, daemon=True).start()
+
+              def on_error(self, exc, val, tb):
+                  import traceback
+                  txt = "".join(traceback.format_exception(exc, val, tb))
+                  path = os.path.join(winutil.crash_dir(), "crash.txt")
+                  try:
+                      with open(path, "w", encoding="utf-8") as f:
+                          f.write("GhostALO %s\n%s\n\n%s" % (VERSION, time.ctime(), txt))
+                  except OSError:
+                      path = "?"
+                  messagebox.showerror("GhostALO", tr("Si è verificato un errore. Il rapporto è salvato qui (non è stato inviato da nessuna parte):") + "\n" + path)
+
+              def reset(self):
+                  self.token += 1
+                  self.cancel.set()
+                  for w in self.box.winfo_children():
+                      w.destroy()
+                  self.canvas.yview_moveto(0)
+
+              def label(self, text, color=DARK, bold=False, size=11, pad=4):
+                  lb = tk.Label(self.box, text=text, fg=color, bg=BG, justify="left", anchor="w",
+                                font=("Consolas", size, "bold" if bold else "normal"), wraplength=WRAP)
+                  lb.pack(fill="x", padx=16, pady=pad)
+                  return lb
+
+              def title(self, s):
+                  self.label("> %s_" % s, GREEN, True, 20, 6)
+                  self.label("=" * 60, GREY, False, 10, 0)
+
+              def section(self, s):
+                  self.label("## %s ##" % s, GREEN, True, 13, 10)
+
+              def button(self, text, action):
+                  b = tk.Button(self.box, text=text, command=action, fg=GREEN, bg=BG, activebackground="#004D14",
+                                activeforeground=GREEN, relief="solid", bd=1, anchor="w", justify="left",
+                                font=FONT_B, padx=10, pady=6, cursor="hand2")
+                  b.pack(fill="x", padx=16, pady=5)
+                  return b
+
+              def check(self, text, value, on_change):
+                  var = tk.BooleanVar(value=value)
+
+                  def changed():
+                      on_change(var.get())
+
+                  cb = tk.Checkbutton(self.box, text=text, variable=var, command=changed, fg=GREEN, bg=BG,
+                                      selectcolor=BG, activebackground=BG, activeforeground=GREEN, anchor="w",
+                                      justify="left", font=FONT_B, wraplength=WRAP)
+                  cb.pack(fill="x", padx=16, pady=3)
+                  return var
+
+              def back(self):
+                  self.button(tr("[<] Menu principale"), self.show_menu)
+
+              # ---------- menu ----------
+
+              def show_menu(self):
+                  self.reset()
+                  self.screen = "menu"
+                  self.label("> GhostALO_", GREEN, True, 26, 4)
+                  self.label(tr("Versione") + " " + VERSION + " (beta) - " + tr("per Windows"), GREY, False, 10, 1)
+                  self.label(tr("Tutto resta nel computer: nessun dato viene inviato."), GREY, False, 10, 1)
+                  self.label("=" * 60, GREY, False, 10, 0)
+                  self.button(tr("[>] CONTROLLO RAPIDO\n     un clic: sicurezza e privacy del PC"), self.show_quick)
+                  self.button(tr("[S] Sicurezza del computer\n     antivirus, firewall, aggiornamenti, cifratura"), self.show_security)
+                  self.button(tr("[P] Controllo privacy\n     avvio automatico, accesso remoto, estensioni, proxy"), self.show_privacy)
+                  self.button(tr("[C] Pulizia\n     temporanei, cache, cookie, file recenti"), self.show_clean_home)
+                  self.button(tr("[G] File grandi e vecchi\n     trova i file che occupano più spazio"), self.show_big_home)
+                  self.button(tr("[?] Informazioni e limiti"), self.show_about)
+
+              # ---------- controllo rapido ----------
+
+              def show_quick(self):
+                  self.reset()
+                  self.screen = "quick"
+                  self.title(tr("CONTROLLO_RAPIDO"))
+                  self.label(tr("Controllo il computer…"), GREY)
+
+                  def work(cancel):
+                      return checks.run_security(), checks.run_privacy()
+
+                  self.run_bg(work, self.render_quick)
+
+              def render_quick(self, res):
+                  self.reset()
+                  self.screen = "quickReport"
+                  self.title(tr("CONTROLLO_RAPIDO"))
+                  if isinstance(res, Exception):
+                      self.label(tr("Non sono riuscito a completare il controllo."), RED)
+                      self.button(tr("[>] Riprova"), self.show_quick)
+                      self.back()
+                      return
+                  sec, priv = res
+                  rows = [c for c in sec if c.status in ("warn", "bad", "info")]
+                  rows += priv.findings()
+                  rows.sort(key=lambda c: -checks.RANK[c.status])
+                  na = [c for c in sec if c.status == "na"]
+                  worst = max([checks.RANK[c.status] for c in rows] or [0])
+                  incomplete = len(na) >= 3 or priv.incomplete()
+                  if worst >= 3:
+                      self.label(tr("[XX] PROBLEMI DA RISOLVERE"), RED, True, 18, 8)
+                  elif worst >= 2:
+                      self.label(tr("[!!] DA VERIFICARE") + " (%d)" % len(rows), ORANGE, True, 18, 8)
+                      self.label(tr("Segnali che richiedono un controllo tuo: non sono la prova di un'infezione."), GREY, False, 10, 2)
+                  elif incomplete:
+                      self.label(tr("[??] CONTROLLO INCOMPLETO"), ORANGE, True, 18, 8)
+                  else:
+                      self.label(tr("[OK] NESSUN SEGNALE RILEVATO"), GREEN, True, 18, 8)
+                  self.section(tr("CONTROLLI ESEGUITI"))
+                  done = [c for c in sec if c.status != "na"]
+                  self.label("[v] " + trf("Sicurezza del computer: %s controlli completati", len(done)), GREY, False, 10, 1)
+                  if na:
+                      self.label("[--] " + trf("%s controlli non verificabili (di solito servono i permessi di amministratore)", len(na)), ORANGE, False, 10, 1)
+                  self.label("[v] " + tr("Privacy: avvio automatico, attività pianificate, accesso remoto, estensioni, file hosts, proxy"), GREY, False, 10, 1)
+                  for c in rows:
+                      col = RED if c.status == "bad" else (ORANGE if c.status == "warn" else DARK)
+                      self.label(("[XX] " if c.status == "bad" else "[!!] " if c.status == "warn" else "[i] ") + c.title + ("\n   " + c.detail if c.detail else ""), col, False, 11, 4)
+                  self.label(tr("Nessun segnale non significa nessun virus: questo programma non è un antivirus e non ha un database di malware."), GREY, False, 10, 8)
+                  self.button(tr("[>] Dettagli sicurezza"), self.show_security)
+                  self.button(tr("[>] Dettagli privacy"), self.show_privacy)
+                  self.button(tr("[>] Ripeti controllo"), self.show_quick)
+                  self.back()
+
+              # ---------- sicurezza ----------
+
+              def show_security(self):
+                  self.reset()
+                  self.screen = "security"
+                  self.title(tr("SICUREZZA_DEL_COMPUTER"))
+                  self.label(tr("Controllo…"), GREY)
+                  self.run_bg(lambda cancel: checks.run_security(), self.render_security)
+
+              def render_security(self, res):
+                  self.reset()
+                  self.title(tr("SICUREZZA_DEL_COMPUTER"))
+                  if isinstance(res, Exception):
+                      self.label(tr("Non sono riuscito a completare il controllo."), RED)
+                      self.back()
+                      return
+                  tag = {"ok": "[OK] ", "info": "[i]  ", "warn": "[!!] ", "bad": "[XX] ", "na": "[--] "}
+                  col = {"ok": GREEN, "info": DARK, "warn": ORANGE, "bad": RED, "na": GREY}
+                  for c in res:
+                      self.label(tag[c.status] + c.title + "\n     " + c.detail, col[c.status], False, 11, 5)
+                  if not winutil.is_admin():
+                      self.label(tr("Alcuni controlli sono più completi se avvii il programma come amministratore (clic destro > Esegui come amministratore)."), GREY, False, 10, 8)
+                  self.button(tr("[>] Ripeti controllo"), self.show_security)
+                  self.back()
+
+              # ---------- privacy ----------
+
+              def show_privacy(self):
+                  self.reset()
+                  self.screen = "privacy"
+                  self.title(tr("CONTROLLO_PRIVACY"))
+                  self.label(tr("Controllo…"), GREY)
+                  self.run_bg(lambda cancel: checks.run_privacy(), self.render_privacy)
+
+              def render_privacy(self, r):
+                  self.reset()
+                  self.title(tr("CONTROLLO_PRIVACY"))
+                  if isinstance(r, Exception):
+                      self.label(tr("Non sono riuscito a completare il controllo."), RED)
+                      self.back()
+                      return
+                  self.label(tr("Sono indizi, non prove: molti programmi legittimi si avviano da soli o permettono l'accesso remoto."), GREY, False, 10, 4)
+                  self.section(tr("DA VERIFICARE"))
+                  f = r.findings()
+                  if not f:
+                      self.label(tr("Nessun segnale evidente."), GREEN)
+                  for c in f:
+                      self.label(("[!!] " if c.status in ("warn", "bad") else "[i] ") + c.title + ("\n     " + c.detail if c.detail else ""), ORANGE if c.status in ("warn", "bad") else DARK, False, 11, 4)
+                  self.section(tr("PROGRAMMI ALL'AVVIO") + " (%d)" % len(r.startup))
+                  for c in r.startup:
+                      self.label("- " + c.title + "\n    " + c.detail, ORANGE if c.status == "warn" else GREY, False, 10, 2)
+                  self.section(tr("ATTIVITÀ PIANIFICATE (NON MICROSOFT)"))
+                  if r.tasks is None:
+                      self.label("[--] " + tr("Non verificabile."), GREY)
+                  elif not r.tasks:
+                      self.label(tr("Nessuna."), GREY)
+                  for c in (r.tasks or []):
+                      self.label("- " + c.title + "\n    " + c.detail, ORANGE if c.status == "warn" else GREY, False, 10, 2)
+                  self.section(tr("ESTENSIONI DEL BROWSER"))
+                  if not r.extensions:
+                      self.label(tr("Nessuna estensione trovata (Chrome, Edge, Brave)."), GREY)
+                  for c in r.extensions:
+                      self.label("- " + c.title + " - " + c.detail, DARK if c.status == "info" else GREY, False, 10, 2)
+                  self.section(tr("PROXY"))
+                  if r.proxy:
+                      self.label(r.proxy.detail, ORANGE if r.proxy.status == "warn" else GREY)
+                  self.button(tr("[>] Ripeti controllo"), self.show_privacy)
+                  self.back()
+
+              # ---------- pulizia ----------
+
+              def show_clean_home(self):
+                  self.reset()
+                  self.screen = "cleanHome"
+                  self.title(tr("PULIZIA"))
+                  self.label(tr("Cerca file inutili e mostra cosa occupano. Prima di eliminare vedi l'elenco e ti viene chiesta conferma. Cache e temporanei si eliminano subito (i programmi li ricreano); i file tuoi vanno nel Cestino di Windows."), GREY, False, 11, 4)
+                  self.button(tr("[>] Avvia scansione"), self.start_clean_scan)
+                  self.back()
+
+              def start_clean_scan(self):
+                  self.reset()
+                  self.screen = "cleanScan"
+                  self.title(tr("PULIZIA"))
+                  self.label(tr("Scansione in corso…"), GREY)
+                  self.button(tr("[x] Annulla"), self.show_clean_home)
+
+                  def work(cancel):
+                      cats = cleaner.build_categories()
+                      return cleaner.scan(cats, cancel)
+
+                  self.run_bg(work, self.render_clean)
+
+              def render_clean(self, cats):
+                  self.reset()
+                  self.screen = "cleanReport"
+                  self.title(tr("RISULTATO_PULIZIA"))
+                  if isinstance(cats, Exception):
+                      self.label(tr("Non sono riuscito a completare la scansione."), RED)
+                      self.button(tr("[>] Riprova"), self.start_clean_scan)
+                      self.back()
+                      return
+                  if not cats:
+                      self.label(tr("Non ho trovato niente da pulire."), GREEN, True, 14)
+                      self.back()
+                      return
+                  self.label(tr("Spunta ciò che vuoi eliminare."), GREY, False, 10, 2)
+                  total = self.label("", ORANGE, True, 11, 6)
+                  state = {c.key: c.checked for c in cats}
+
+                  def upd():
+                      sel = [c for c in cats if state[c.key]]
+                      total.config(text=trf("Selezionato: %s", fmt(sum(c.bytes for c in sel))))
+
+                  for c in cats:
+                      def mk(cat):
+                          def ch(v):
+                              state[cat.key] = v
+                              upd()
+                          return ch
+                      self.check("%s - %s, %s" % (c.title, items(c.count), fmt(c.bytes)), c.checked, mk(c))
+                      self.label(c.hint, GREY, False, 10, 0)
+                      running = cleaner.process_running(c)
+                      if running:
+                          self.label(tr("[!!] Chiudi prima: ") + ", ".join(running), ORANGE, False, 10, 0)
+                      for it in c.items[:3]:
+                          self.label("   " + it.path, GREY, False, 9, 0)
+                  upd()
+
+                  def go():
+                      sel = [c for c in cats if state[c.key]]
+                      if not sel:
+                          messagebox.showinfo("GhostALO", tr("Nessuna voce selezionata."))
+                          return
+                      n = sum(c.count for c in sel)
+                      b = sum(c.bytes for c in sel)
+                      msg = trf("Verranno eliminati %s (", items(n)) + fmt(b) + tr("). Le voci dei file tuoi vanno nel Cestino di Windows, le altre vengono eliminate subito. Continuare?")
+                      if messagebox.askyesno(tr("Conferma eliminazione"), msg):
+                          self.do_delete(sel)
+
+                  self.button(tr("[>] Elimina selezionati"), go)
+                  self.button(tr("[>] Ripeti scansione"), self.start_clean_scan)
+                  self.back()
+
+              def do_delete(self, sel):
+                  self.reset()
+                  self.screen = "cleanDelete"
+                  self.title(tr("ELIMINAZIONE"))
+                  self.label(tr("Eliminazione in corso…"), GREEN, True, 14)
+                  self.run_bg(lambda cancel: cleaner.delete(sel), self.render_deleted)
+
+              def render_deleted(self, res):
+                  self.reset()
+                  self.title(tr("PULIZIA_COMPLETATA"))
+                  if isinstance(res, Exception):
+                      self.label(tr("Si è verificato un errore durante l'eliminazione."), RED)
+                  else:
+                      if res.freed:
+                          self.label(tr("Spazio liberato: ") + fmt(res.freed), GREEN, True, 16, 6)
+                      if res.recycled:
+                          self.label(tr("Spostati nel Cestino: ") + fmt(res.recycled), GREEN, True, 14, 4)
+                          self.label(tr("Lo spazio si libera quando svuoti il Cestino di Windows."), GREY, False, 10, 0)
+                      if res.changed:
+                          self.label(trf("%s file sono cambiati dopo la scansione e non sono stati toccati.", res.changed), ORANGE)
+                      if res.failed:
+                          self.label(trf("%s file non è stato possibile eliminarli (in uso o protetti).", res.failed), ORANGE)
+                  self.button(tr("[>] Nuova scansione"), self.start_clean_scan)
+                  self.back()
+
+              # ---------- file grandi ----------
+
+              big_mb = 500
+              big_days = 90
+
+              def show_big_home(self):
+                  self.reset()
+                  self.screen = "bigHome"
+                  self.title(tr("FILE_GRANDI_E_VECCHI"))
+                  self.label(tr("Cerca nella tua cartella utente (esclusa AppData) i file pesanti non modificati da tempo. Vedi l'elenco e confermi tu; i file vanno nel Cestino."), GREY, False, 11, 4)
+                  self.section(tr("DIMENSIONE MINIMA"))
+                  for m in (100, 500, 1000):
+                      self.button(("[x] " if m == self.big_mb else "[ ] ") + "%d MB" % m, lambda m=m: self.set_big(m, None))
+                  self.section(tr("NON MODIFICATI DA"))
+                  for d in (30, 90, 365):
+                      self.button(("[x] " if d == self.big_days else "[ ] ") + trf("%s giorni", d), lambda d=d: self.set_big(None, d))
+                  self.button(tr("[>] Avvia scansione"), self.start_big_scan)
+                  self.back()
+
+              def set_big(self, mb, days):
+                  if mb:
+                      self.big_mb = mb
+                  if days:
+                      self.big_days = days
+                  self.show_big_home()
+
+              def start_big_scan(self):
+                  self.reset()
+                  self.screen = "bigScan"
+                  self.title(tr("FILE_GRANDI_E_VECCHI"))
+                  self.label(tr("Scansione in corso…"), GREY)
+                  self.button(tr("[x] Annulla"), self.show_big_home)
+                  mb, days = self.big_mb, self.big_days
+                  home = cleaner.default_env()["USERPROFILE"]
+                  self.run_bg(lambda cancel: cleaner.scan_big(home, mb, days, cancel), self.render_big)
+
+              def render_big(self, cat):
+                  self.reset()
+                  self.screen = "bigReport"
+                  self.title(tr("FILE_GRANDI_E_VECCHI"))
+                  if isinstance(cat, Exception):
+                      self.label(tr("Non sono riuscito a completare la scansione."), RED)
+                      self.button(tr("[<] Cambia criteri"), self.show_big_home)
+                      self.back()
+                      return
+                  if not cat.items:
+                      self.label(tr("Nessun file trovato con questi criteri."), GREEN)
+                      self.button(tr("[<] Cambia criteri"), self.show_big_home)
+                      self.back()
+                      return
+                  chosen = set()
+                  total = self.label("", ORANGE, True, 11, 6)
+
+                  def upd():
+                      total.config(text=trf("Selezionati: %s file, %s", len(chosen), fmt(sum(i.size for i in cat.items if i.path in chosen))))
+
+                  for it in cat.items:
+                      def mk(item):
+                          def ch(v):
+                              (chosen.add if v else chosen.discard)(item.path)
+                              upd()
+                          return ch
+                      age = int((time.time() - it.mtime) / 86400)
+                      self.check("%s\n%s - %s\n%s" % (os.path.basename(it.path), fmt(it.size), trf("%s giorni", age), os.path.dirname(it.path)), False, mk(it))
+                  upd()
+
+                  def go():
+                      sel = [i for i in cat.items if i.path in chosen]
+                      if not sel:
+                          messagebox.showinfo("GhostALO", tr("Nessun file selezionato."))
+                          return
+                      if messagebox.askyesno(tr("Eliminare questi file?"), trf("%s file, %s. Vanno nel Cestino di Windows e puoi ripristinarli.", len(sel), fmt(sum(i.size for i in sel)))):
+                          c2 = cleaner.Category("big", cat.title, cat.hint, "recycle", False, cat.roots)
+                          c2.items = sel
+                          self.do_delete([c2])
+
+                  self.button(tr("[>] Elimina i selezionati"), go)
+                  self.button(tr("[<] Cambia criteri"), self.show_big_home)
+                  self.back()
+
+              # ---------- info ----------
+
+              def show_about(self):
+                  self.reset()
+                  self.screen = "about"
+                  self.title("INFO")
+                  self.label(tr("GhostALO per Windows usa solo funzioni ufficiali di Windows. Non invia nulla, non ha un database di malware e non elimina niente senza la tua conferma."), DARK)
+                  self.section(tr("Limiti"))
+                  self.label(tr("• Non è un antivirus: cerca indizi, non virus.\n• Alcuni controlli richiedono i permessi di amministratore.\n• I risultati sono indizi, non prove.\n• Cache e temporanei si eliminano subito; i file tuoi vanno nel Cestino.\n• Se sospetti un controllo nascosto del PC, il ripristino di Windows è la soluzione più sicura (salva prima i dati e cambia le password da un altro dispositivo)."), GREY, False, 11, 4)
+                  self.back()
+
+
+          def main():
+              from . import i18n
+              i18n.init()
+              root = tk.Tk()
+              App(root)
+              root.mainloop()
+          EOF_PRJ
+          mkdir -p "$(dirname 'src/ghostalo/winutil.py')"
+          cat > 'src/ghostalo/winutil.py' <<'EOF_PRJ'
+          """Funzioni di basso livello per Windows. Ogni errore diventa un risultato 'non disponibile'."""
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+
+          IS_WIN = os.name == "nt"
+          _NO_WINDOW = 0x08000000 if IS_WIN else 0
+
+          try:
+              import winreg  # type: ignore
+          except ImportError:  # non Windows (test)
+              winreg = None
+
+
+          def pj(base, rel):
+              """Unisce una cartella base e un percorso scritto con il backslash di Windows."""
+              return os.path.join(base, *rel.split("\\"))
+
+
+          def run(cmd, timeout=25):
+              """Esegue un comando. Restituisce (codice, testo) oppure (None, '') se fallisce."""
+              try:
+                  p = subprocess.run(
+                      cmd, capture_output=True, text=True, timeout=timeout,
+                      errors="replace", creationflags=_NO_WINDOW, stdin=subprocess.DEVNULL,
+                  )
+                  return p.returncode, p.stdout or ""
+              except Exception:
+                  return None, ""
+
+
+          def powershell(script, timeout=30):
+              return run(
+                  ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                  timeout,
+              )
+
+
+          def powershell_json(script, timeout=30):
+              """Esegue uno script che stampa JSON. Restituisce una lista (anche vuota) o None se non disponibile."""
+              rc, out = powershell(script, timeout)
+              if rc is None or rc != 0:
+                  return None
+              out = out.strip()
+              if not out:
+                  return []
+              try:
+                  data = json.loads(out)
+              except ValueError:
+                  return None
+              return data if isinstance(data, list) else [data]
+
+
+          def reg_get(hive, path, name):
+              """Legge un valore del registro; None se manca o non è leggibile."""
+              if winreg is None:
+                  return None
+              try:
+                  h = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}[hive]
+                  with winreg.OpenKey(h, path) as k:
+                      return winreg.QueryValueEx(k, name)[0]
+              except OSError:
+                  return None
+
+
+          def reg_values(hive, path):
+              """Elenco (nome, valore) di una chiave; lista vuota se manca."""
+              out = []
+              if winreg is None:
+                  return out
+              try:
+                  h = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}[hive]
+                  with winreg.OpenKey(h, path) as k:
+                      i = 0
+                      while True:
+                          try:
+                              n, v, _ = winreg.EnumValue(k, i)
+                          except OSError:
+                              break
+                          out.append((n, v))
+                          i += 1
+              except OSError:
+                  pass
+              return out
+
+
+          def reg_subkeys(hive, path):
+              out = []
+              if winreg is None:
+                  return out
+              try:
+                  h = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}[hive]
+                  with winreg.OpenKey(h, path) as k:
+                      i = 0
+                      while True:
+                          try:
+                              out.append(winreg.EnumKey(k, i))
+                          except OSError:
+                              break
+                          i += 1
+              except OSError:
+                  pass
+              return out
+
+
+          def is_admin():
+              if not IS_WIN:
+                  return False
+              try:
+                  import ctypes
+                  return bool(ctypes.windll.shell32.IsUserAnAdmin())
+              except Exception:
+                  return False
+
+
+          def running_processes():
+              """Nomi dei processi attivi in minuscolo (tasklist, indipendente dalla lingua)."""
+              rc, out = run(["tasklist", "/fo", "csv", "/nh"], 20)
+              names = set()
+              if rc != 0:
+                  return names
+              for line in out.splitlines():
+                  line = line.strip()
+                  if line.startswith('"'):
+                      names.add(line.split('","')[0].strip('"').lower())
+              return names
+
+
+          def recycle(path):
+              """Sposta un file o una cartella nel Cestino di Windows. True se riuscito.
+              Fuori da Windows (solo test) sposta in una cartella di prova."""
+              if not IS_WIN:
+                  try:
+                      dest = os.path.join(os.path.expanduser("~"), ".ghostalo_test_trash")
+                      os.makedirs(dest, exist_ok=True)
+                      base = os.path.basename(path.rstrip("/\\"))
+                      target = os.path.join(dest, base)
+                      n = 1
+                      while os.path.exists(target):
+                          target = os.path.join(dest, "%s.%d" % (base, n))
+                          n += 1
+                      shutil.move(path, target)
+                      return True
+                  except Exception:
+                      return False
+              try:
+                  import ctypes
+                  from ctypes import wintypes
+
+                  class SHFILEOPSTRUCTW(ctypes.Structure):
+                      _fields_ = [
+                          ("hwnd", wintypes.HWND),
+                          ("wFunc", wintypes.UINT),
+                          ("pFrom", wintypes.LPCWSTR),
+                          ("pTo", wintypes.LPCWSTR),
+                          ("fFlags", ctypes.c_ushort),
+                          ("fAnyOperationsAborted", wintypes.BOOL),
+                          ("hNameMappings", ctypes.c_void_p),
+                          ("lpszProgressTitle", wintypes.LPCWSTR),
+                      ]
+
+                  FO_DELETE = 3
+                  FOF_SILENT = 0x0004
+                  FOF_NOCONFIRMATION = 0x0010
+                  FOF_ALLOWUNDO = 0x0040
+                  FOF_NOERRORUI = 0x0400
+                  op = SHFILEOPSTRUCTW()
+                  op.hwnd = None
+                  op.wFunc = FO_DELETE
+                  op.pFrom = os.path.abspath(path) + "\0"
+                  op.pTo = None
+                  op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+                  rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+                  return rc == 0 and not op.fAnyOperationsAborted
+              except Exception:
+                  return False
+
+
+          def crash_dir():
+              base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+              d = os.path.join(base, "GhostALO")
+              try:
+                  os.makedirs(d, exist_ok=True)
+              except OSError:
+                  pass
+              return d
+
+
+          def resource_path(rel):
+              base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+              return os.path.join(base, rel)
+          EOF_PRJ
+          mkdir -p "$(dirname 'tests/__init__.py')"
+          cat > 'tests/__init__.py' <<'EOF_PRJ'
+          # test di GhostALO per Windows
+          EOF_PRJ
+          mkdir -p "$(dirname 'tests/test_checks.py')"
+          cat > 'tests/test_checks.py' <<'EOF_PRJ'
+          import datetime
+          import os
+          import sys
+          import unittest
+
+          sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+          from ghostalo import checks  # noqa: E402
+          from ghostalo.i18n import set_italian  # noqa: E402
+
+
+          class ChecksTest(unittest.TestCase):
+              def setUp(self):
+                  set_italian(True)
+
+              def test_hotfix_days(self):
+                  self.assertEqual(checks.parse_hotfix_days("2026-10-01", datetime.date(2026, 10, 31)), 30)
+                  self.assertIsNone(checks.parse_hotfix_days("boh"))
+                  self.assertIsNone(checks.parse_hotfix_days(""))
+
+              def test_classify_command(self):
+                  self.assertEqual(checks.classify_command(r"C:\Program Files\App\app.exe"), "info")
+                  self.assertEqual(checks.classify_command(r"C:\Users\x\AppData\Local\Temp\a.exe"), "warn")
+                  self.assertEqual(checks.classify_command(r"C:\Users\x\Downloads\setup.exe"), "warn")
+                  self.assertEqual(checks.classify_command("powershell.exe -enc AAAA"), "warn")
+                  self.assertEqual(checks.classify_command(None), "info")
+
+              def test_classify_program(self):
+                  self.assertEqual(checks.classify_program("AnyDesk"), "info")
+                  self.assertEqual(checks.classify_program("Spyrix Free Keylogger"), "warn")
+                  self.assertIsNone(checks.classify_program("Notepad++"))
+
+              def test_manifest(self):
+                  broad = '{"name":"Ext","permissions":["storage"],"host_permissions":["<all_urls>"]}'
+                  self.assertEqual(checks.parse_manifest(broad), ("Ext", True))
+                  narrow = '{"name":"E2","permissions":["storage"]}'
+                  self.assertEqual(checks.parse_manifest(narrow), ("E2", False))
+                  cs = '{"name":"E3","content_scripts":[{"matches":["*://*/*"]}]}'
+                  self.assertEqual(checks.parse_manifest(cs), ("E3", True))
+                  self.assertIsNone(checks.parse_manifest("non json"))
+
+              def test_hosts(self):
+                  text = "# commento\n127.0.0.1 localhost\n::1 localhost\n\n0.0.0.0 ads.example.com # blocco\n"
+                  self.assertEqual(checks.parse_hosts(text), ["0.0.0.0 ads.example.com"])
+
+              def test_unavailable_is_never_ok(self):
+                  # Fuori da Windows nessun controllo può risultare 'ok' per errore.
+                  if os.name == "nt":
+                      self.skipTest("solo fuori da Windows")
+                  res = checks.run_security()
+                  self.assertTrue(all(c.status != "ok" for c in res if c.title not in ("Account amministratore",)))
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          EOF_PRJ
+          mkdir -p "$(dirname 'tests/test_cleaner.py')"
+          cat > 'tests/test_cleaner.py' <<'EOF_PRJ'
+          import os
+          import shutil
+          import sys
+          import tempfile
+          import time
+          import unittest
+
+          sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+          from ghostalo import cleaner, winutil  # noqa: E402
+          from ghostalo.winutil import pj  # noqa: E402
+          from ghostalo.i18n import set_italian  # noqa: E402
+
+          DAY = 86400
+
+
+          def touch(path, size=100, age_days=0):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "wb") as f:
+                  f.write(b"x" * size)
+              t = time.time() - age_days * DAY
+              os.utime(path, (t, t))
+
+
+          class CleanerTest(unittest.TestCase):
+              def setUp(self):
+                  set_italian(True)
+                  self.d = tempfile.mkdtemp()
+                  self.env = {
+                      "TEMP": os.path.join(self.d, "Local", "Temp"),
+                      "LOCALAPPDATA": os.path.join(self.d, "Local"),
+                      "APPDATA": os.path.join(self.d, "Roaming"),
+                      "USERPROFILE": os.path.join(self.d, "User"),
+                  }
+                  self.trash = os.path.join(self.d, "fake_recycle")
+                  os.makedirs(self.trash)
+                  self._orig = winutil.recycle
+
+                  def fake_recycle(p):
+                      shutil.move(p, os.path.join(self.trash, os.path.basename(p)))
+                      return True
+
+                  winutil.recycle = fake_recycle
+
+              def tearDown(self):
+                  winutil.recycle = self._orig
+                  shutil.rmtree(self.d, ignore_errors=True)
+
+              def populate(self):
+                  e = self.env
+                  touch(os.path.join(e["TEMP"], "old.tmp"), 500, 3)
+                  touch(os.path.join(e["TEMP"], "new.tmp"), 500, 0)
+                  touch(os.path.join(e["LOCALAPPDATA"], "CrashDumps", "a.dmp"), 300, 1)
+                  touch(pj(e["LOCALAPPDATA"], r"Google\Chrome\User Data\Default\Cache\f_1"), 200)
+                  touch(pj(e["LOCALAPPDATA"], r"Google\Chrome\User Data\Default\Network\Cookies"), 50)
+                  touch(pj(e["LOCALAPPDATA"], r"Google\Chrome\User Data\Default\Network\Other"), 50)
+                  touch(os.path.join(e["USERPROFILE"], "Downloads", "setup.exe"), 1000, 100)
+                  touch(os.path.join(e["USERPROFILE"], "Downloads", "recent.exe"), 1000, 5)
+                  touch(os.path.join(e["USERPROFILE"], "Downloads", "notes.txt"), 1000, 200)
+
+              def test_scan_finds_only_expected(self):
+                  self.populate()
+                  cats = {c.key: c for c in cleaner.scan(cleaner.build_categories(self.env))}
+                  self.assertEqual([i.size for i in cats["temp"].items], [500])
+                  self.assertEqual(cats["dumps"].count, 1)
+                  self.assertEqual(cats["browser"].count, 1)
+                  self.assertEqual(cats["cookies"].count, 1)
+                  self.assertEqual(cats["installers"].count, 1)
+                  self.assertTrue(cats["installers"].items[0].path.endswith("setup.exe"))
+                  self.assertEqual(cats["installers"].mode, "recycle")
+
+              def test_delete_and_recycle(self):
+                  self.populate()
+                  cats = [c for c in cleaner.scan(cleaner.build_categories(self.env)) if c.key in ("temp", "installers")]
+                  res = cleaner.delete(cats)
+                  self.assertEqual(res.freed, 500)
+                  self.assertEqual(res.recycled, 1000)
+                  self.assertEqual(res.failed, 0)
+                  self.assertFalse(os.path.exists(os.path.join(self.env["TEMP"], "old.tmp")))
+                  self.assertTrue(os.path.exists(os.path.join(self.env["TEMP"], "new.tmp")))
+                  self.assertTrue(os.path.exists(os.path.join(self.trash, "setup.exe")))
+                  self.assertTrue(os.path.exists(os.path.join(self.env["USERPROFILE"], "Downloads", "notes.txt")))
+
+              def test_changed_file_is_not_touched(self):
+                  self.populate()
+                  cats = [c for c in cleaner.scan(cleaner.build_categories(self.env)) if c.key == "temp"]
+                  p = os.path.join(self.env["TEMP"], "old.tmp")
+                  with open(p, "ab") as f:
+                      f.write(b"more data")
+                  res = cleaner.delete(cats)
+                  self.assertEqual(res.changed, 1)
+                  self.assertEqual(res.freed, 0)
+                  self.assertTrue(os.path.exists(p))
+
+              def test_vanished_file_is_ignored(self):
+                  self.populate()
+                  cats = [c for c in cleaner.scan(cleaner.build_categories(self.env)) if c.key == "temp"]
+                  os.remove(os.path.join(self.env["TEMP"], "old.tmp"))
+                  res = cleaner.delete(cats)
+                  self.assertEqual((res.freed, res.failed, res.changed), (0, 0, 0))
+
+              def test_item_outside_roots_is_refused(self):
+                  self.populate()
+                  outside = os.path.join(self.d, "precious.txt")
+                  touch(outside, 10, 400)
+                  cat = cleaner.Category("temp", "t", "h", "delete", True, [self.env["TEMP"]])
+                  st = os.stat(outside)
+                  cat.items = [cleaner.Item(outside, st.st_size, st.st_mtime)]
+                  res = cleaner.delete([cat])
+                  self.assertEqual(res.failed, 1)
+                  self.assertTrue(os.path.exists(outside))
+
+              def test_symlink_not_followed(self):
+                  self.populate()
+                  target = os.path.join(self.d, "secret")
+                  touch(os.path.join(target, "s.tmp"), 10, 5)
+                  link = os.path.join(self.env["TEMP"], "link")
+                  try:
+                      os.symlink(target, link, target_is_directory=True)
+                  except (OSError, NotImplementedError):
+                      self.skipTest("collegamenti simbolici non disponibili")
+                  cats = [c for c in cleaner.scan(cleaner.build_categories(self.env)) if c.key == "temp"]
+                  cleaner.delete(cats)
+                  self.assertTrue(os.path.exists(os.path.join(target, "s.tmp")))
+
+              def test_odd_temp_variable_is_ignored(self):
+                  env = dict(self.env)
+                  env["TEMP"] = self.d  # punta fuori dal profilo: non va usata
+                  touch(os.path.join(self.d, "other", "x.tmp"), 10, 5)
+                  cats = {c.key: c for c in cleaner.scan(cleaner.build_categories(env))}
+                  self.assertNotIn("temp", cats)
+
+              def test_scan_big(self):
+                  touch(os.path.join(self.env["USERPROFILE"], "Videos", "big.bin"), 3 * 1024 * 1024, 200)
+                  touch(os.path.join(self.env["USERPROFILE"], "Videos", "recent.bin"), 3 * 1024 * 1024, 1)
+                  touch(os.path.join(self.env["USERPROFILE"], "AppData", "x.bin"), 3 * 1024 * 1024, 200)
+                  touch(os.path.join(self.env["USERPROFILE"], "Videos", "small.bin"), 100, 200)
+                  cat = cleaner.scan_big(self.env["USERPROFILE"], 1, 90)
+                  self.assertEqual([os.path.basename(i.path) for i in cat.items], ["big.bin"])
+
+              def test_cancel(self):
+                  import threading
+                  self.populate()
+                  ev = threading.Event()
+                  ev.set()
+                  with self.assertRaises(cleaner.Cancelled):
+                      cleaner.scan(cleaner.build_categories(self.env), ev)
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          EOF_PRJ
+          mkdir -p "$(dirname 'tests/test_ui_smoke.py')"
+          cat > 'tests/test_ui_smoke.py' <<'EOF_PRJ'
+          """Prova l'interfaccia con un tkinter finto: scova errori di nomi e di logica in tutte le schermate."""
+          import os
+          import shutil
+          import sys
+          import tempfile
+          import threading
+          import unittest
+          from unittest import mock
+
+          sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+
+          class UiSmokeTest(unittest.TestCase):
+              def setUp(self):
+                  self.tk = mock.MagicMock()
+                  patcher = mock.patch.dict(sys.modules, {"tkinter": self.tk, "tkinter.messagebox": self.tk.messagebox})
+                  patcher.start()
+                  self.addCleanup(patcher.stop)
+                  import importlib
+                  import ghostalo
+                  sys.modules.pop("ghostalo.ui", None)
+                  if hasattr(ghostalo, "ui"):
+                      delattr(ghostalo, "ui")
+                  ui = importlib.import_module("ghostalo.ui")
+                  from ghostalo import cleaner
+                  from ghostalo.i18n import set_italian
+                  set_italian(True)
+                  self.ui = ui
+                  self.d = tempfile.mkdtemp()
+                  self.addCleanup(shutil.rmtree, self.d, True)
+                  env = {k: os.path.join(self.d, k) for k in ("LOCALAPPDATA", "APPDATA", "USERPROFILE")}
+                  env["TEMP"] = os.path.join(env["LOCALAPPDATA"], "Temp")
+                  os.makedirs(env["TEMP"])
+                  p = os.path.join(env["TEMP"], "old.tmp")
+                  with open(p, "wb") as f:
+                      f.write(b"x" * 100)
+                  os.utime(p, (1, 1))
+                  self.p = p
+                  mock.patch.object(cleaner, "default_env", lambda: env).start()
+                  self.addCleanup(mock.patch.stopall)
+                  mock.patch.object(ui.App, "run_bg", lambda s, fn, done: done(fn(threading.Event()))).start()
+                  mock.patch.object(ui.App, "poll", lambda s: None).start()
+                  self.app = ui.App(mock.MagicMock())
+
+              def texts(self):
+                  out = []
+                  for call in self.tk.Label.call_args_list:
+                      out.append(call.kwargs.get("text", ""))
+                  return "\n".join(out)
+
+              def test_all_screens_render(self):
+                  a = self.app
+                  for fn in (a.show_menu, a.show_quick, a.show_security, a.show_privacy, a.show_clean_home,
+                             a.show_big_home, a.show_about):
+                      self.tk.reset_mock()
+                      fn()
+                      self.assertTrue(self.tk.Label.called or self.tk.Button.called)
+
+              def test_error_results_render(self):
+                  a = self.app
+                  err = RuntimeError("boom")
+                  for fn in (a.render_quick, a.render_security, a.render_privacy, a.render_clean, a.render_big, a.render_deleted):
+                      fn(err)
+
+              def test_clean_flow_deletes_after_confirm(self):
+                  a = self.app
+                  self.tk.messagebox.askyesno.return_value = True
+                  a.start_clean_scan()
+                  self.assertIn("File temporanei", self.texts() + "".join(str(c) for c in self.tk.Checkbutton.call_args_list))
+                  buttons = [c for c in self.tk.Button.call_args_list if "Elimina selezionati" in c.kwargs.get("text", "")]
+                  self.assertTrue(buttons)
+                  buttons[0].kwargs["command"]()
+                  self.assertFalse(os.path.exists(self.p))
+                  self.assertIn("Spazio liberato", self.texts())
+
+              def test_clean_flow_declined_keeps_file(self):
+                  a = self.app
+                  self.tk.messagebox.askyesno.return_value = False
+                  a.start_clean_scan()
+                  buttons = [c for c in self.tk.Button.call_args_list if "Elimina selezionati" in c.kwargs.get("text", "")]
+                  buttons[0].kwargs["command"]()
+                  self.assertTrue(os.path.exists(self.p))
+
+              def test_english(self):
+                  from ghostalo.i18n import set_italian
+                  set_italian(False)
+                  self.tk.reset_mock()
+                  self.app.show_about()
+                  self.assertIn("Limits", self.texts())
+
+
+          if __name__ == "__main__":
+              unittest.main()
+          EOF_PRJ
+
+      - name: Salva nel repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Aggiorna il progetto GhostALO per Windows" || echo "Nessuna modifica da salvare"
+          git push
+
+      - name: Avvia la compilazione
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref main
