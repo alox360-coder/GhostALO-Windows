@@ -1,0 +1,50 @@
+name: Build
+
+# Compila GhostALO per Windows (file .exe) e lo pubblica nelle Releases.
+# Si avvia a mano (Actions -> Build -> Run workflow) o dal workflow "Inizializza progetto".
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      # Le azioni sono bloccate per commit (SHA) per evitare modifiche a sorpresa.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Test automatici
+        run: python -m unittest discover -s tests -v
+
+      - name: Installa PyInstaller
+        run: python -m pip install pyinstaller
+
+      - name: Compila il programma
+        run: python -m PyInstaller --onefile --windowed --name GhostALO --paths src main.py
+
+      - name: Crea il checksum
+        shell: pwsh
+        run: |
+          Copy-Item dist\GhostALO.exe GhostALO.exe
+          $h = (Get-FileHash GhostALO.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  GhostALO.exe" | Out-File -Encoding ascii GhostALO.exe.sha256
+          Get-Content GhostALO.exe.sha256
+          "SHA-256: $h" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Pubblica la release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: win-build-${{ github.run_number }}
+          name: GhostALO per Windows (build ${{ github.run_number }})
+          prerelease: true
+          files: |
+            GhostALO.exe
+            GhostALO.exe.sha256
