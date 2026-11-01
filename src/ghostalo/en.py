@@ -144,6 +144,7 @@ EN = {
 "Controllo non riuscito.": "Check failed.",
 "Può leggere tutti i siti che visiti.": "Can read every site you visit.",
 "Accesso limitato.": "Limited access.",
+"comando non disponibile": "command not available",
 "Accesso remoto o monitoraggio: ": "Remote access or monitoring: ",
 "Avvio automatico: ": "Startup: ",
 "Attività pianificata: ": "Scheduled task: ",

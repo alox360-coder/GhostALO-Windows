@@ -190,7 +190,14 @@ def _tasks():
     )
     if rows is None:
         return None
-    return [Check(classify_command(str(r.get("Exec"))), str(r.get("Name")), str(r.get("Exec") or "").strip()) for r in rows]
+    out = []
+    for r in rows:
+        cmd = str(r.get("Exec") or "").strip()
+        if cmd in ("", "None"):
+            out.append(Check("info", str(r.get("Name")), tr("comando non disponibile")))
+        else:
+            out.append(Check(classify_command(cmd), str(r.get("Name")), cmd))
+    return out
 
 
 REMOTE_TOOLS = (
@@ -255,6 +262,28 @@ def parse_manifest(text):
     return name, broad
 
 
+def resolve_name(name, ext_dir, default_locale=None):
+    """Risolve un nome tipo __MSG_appName__ leggendo _locales/<lingua>/messages.json."""
+    if not (name.startswith("__MSG_") and name.endswith("__")):
+        return name
+    key = name[6:-2].lower()
+    langs = [l for l in (default_locale, "it", "en", "en_US", "en_GB") if l]
+    try:
+        langs += [d for d in os.listdir(os.path.join(ext_dir, "_locales")) if d not in langs]
+    except OSError:
+        return None
+    for lang in langs:
+        try:
+            with open(os.path.join(ext_dir, "_locales", lang, "messages.json"), encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for k, v in data.items():
+            if k.lower() == key and isinstance(v, dict) and v.get("message"):
+                return str(v["message"])
+    return None
+
+
 def _extensions():
     local = os.environ.get("LOCALAPPDATA", "")
     roots = {
@@ -276,7 +305,11 @@ def _extensions():
             name, broad = parsed
             ext_id = manifest.split(os.sep)[-3]
             if name.startswith("__MSG_"):
-                name = ext_id
+                try:
+                    dl = json.loads(open(manifest, encoding="utf-8-sig").read()).get("default_locale")
+                except (OSError, ValueError):
+                    dl = None
+                name = resolve_name(name, os.path.dirname(manifest), dl) or ext_id
             out.append(Check(
                 "info" if broad else "ok", "%s: %s" % (browser, name),
                 tr("Può leggere tutti i siti che visiti.") if broad else tr("Accesso limitato."),

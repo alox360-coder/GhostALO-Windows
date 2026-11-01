@@ -39,6 +39,17 @@ class ChecksTest(unittest.TestCase):
         self.assertEqual(checks.parse_manifest(cs), ("E3", True))
         self.assertIsNone(checks.parse_manifest("non json"))
 
+    def test_resolve_name(self):
+        import json, tempfile
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "_locales", "en"))
+        with open(os.path.join(d, "_locales", "en", "messages.json"), "w", encoding="utf-8") as f:
+            json.dump({"appName": {"message": "Mia Estensione"}}, f)
+        self.assertEqual(checks.resolve_name("__MSG_appName__", d, "en"), "Mia Estensione")
+        self.assertEqual(checks.resolve_name("__MSG_appname__", d), "Mia Estensione")
+        self.assertIsNone(checks.resolve_name("__MSG_manca__", d, "en"))
+        self.assertEqual(checks.resolve_name("Normale", d), "Normale")
+
     def test_hosts(self):
         text = "# commento\n127.0.0.1 localhost\n::1 localhost\n\n0.0.0.0 ads.example.com # blocco\n"
         self.assertEqual(checks.parse_hosts(text), ["0.0.0.0 ads.example.com"])
